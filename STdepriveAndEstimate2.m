@@ -1,0 +1,125 @@
+function Zhat = STdepriveAndEstimate2(R_min,R_max,N,Rin, Rout, PF_samples, target_point, STmodels, wgs84, height, R,mode)
+    % depriveAndEstimate - 执行数据剔除和universal Kriging估计
+    %
+    % 输入:
+    %   Rin           - 数据剔除的内半径 (km)
+    %   Rout          - 数据剔除的外半径 (km)
+    %   PF_samples    - 样本点矩阵 (IPP数据: 纬度, 经度, 值等)
+    %   target_point  - 待估计的目标点 (IGP: 时间, 纬度, 经度等)
+    %   vstruct_UnK   - universal Kriging的变差函数结构
+    %   UnK_fit       - Kriging拟合参数
+    %   N_min         - 估计所需的最小样本数
+    %   wgs84         - WGS84椭球模型
+    %   height        - 坐标转换的高度 (km)
+    %   R             - 地球半径 (km)
+    %
+    % 输出:
+    %   Zhat          - 目标点的估计值，若估计失败则返回NaN
+
+    % Settings:
+    Nmin=N(1);
+    Ntarget=N(2);
+
+    % 提取目标点坐标
+    lat1 = target_point(3); % IGP纬度
+    lon1 = target_point(4); % IGP经度
+
+    % 提取样本点坐标
+    lat2 = PF_samples(:, 3); % IPP纬度
+    lon2 = PF_samples(:, 4); % IPP经度
+
+    % 使用Haversine公式计算距离
+    dlat = deg2rad(lat2 - lat1);
+    dlon = deg2rad(lon2 - lon1);
+    a = sin(dlat/2).^2 + cos(deg2rad(lat1)) .* cos(deg2rad(lat2)) .* sin(dlon/2).^2;
+    c = 2 * atan2(sqrt(a), sqrt(1 - a));
+    Dist = R * c; % 距离 (km)
+    t=target_point(1)-PF_samples(:, 1);
+    allvariogram = stpacked(STmodels,Dist, t);
+    switch mode
+        case 'fixed width' %fixed width
+            % 创建掩码，剔除Rin < Dist <= Rout的样本
+            mask = (allvariogram <= min(Rin,Rout))| (allvariogram > max(Rin,Rout));
+        case 'space delete'
+            mask = (Dist <= min(Rin,Rout))| (Dist > max(Rin,Rout));
+        case 'temporal delete'
+            mask = (t <= min(Rin,Rout))| (t > max(Rin,Rout));
+    end
+    % 选择剩余样本
+    PF_remaining = PF_samples(mask, :);
+    Dist_remaining = Dist(mask);
+    t_remaining=t(mask);
+    variogram_remaining=allvariogram(mask);
+
+    % 检查剩余样本数量
+    if size(PF_remaining, 1) < Nmin
+        Zhat = NaN; % 样本不足
+        return;
+    elseif size(PF_remaining, 1) > Ntarget
+        PF_remaining = PF_remaining(1:Ntarget, :);
+        Dist_remaining = Dist_remaining(1:Ntarget);
+        t_remaining=t_remaining(1:Ntarget);
+        variogram_remaining=variogram_remaining(1:Ntarget);
+    end
+    numelIPPs=size(PF_remaining, 1);
+    if numelIPPs >= Ntarget
+        % 正常：选满 N_target，则 Rfitt = max(选中样本距离, R_min)
+        Rfitt = max(max(Dist_remaining), R_min);
+    else
+        % 欠采样：R_max 内总样本数在 [N_min, N_target) ⇒ Rfitt = R_max（WAAS 规则）
+        Rfitt = R_max;
+    end
+    R_T   = max(t_remaining);
+
+    % 准备Kriging：转换为ENU坐标
+    East2 = zeros(size(PF_remaining, 1), 1);
+    North2 = zeros(size(PF_remaining, 1), 1);
+    for k = 1:size(PF_remaining, 1)
+        [East, North, ~] = geodetic2enu(...
+            PF_remaining(k, 3), PF_remaining(k, 4), height, ...
+            lat1, lon1, height, wgs84, 'degrees');
+        East2(k) = East;
+        North2(k) = North;
+    end
+
+    % 准备Kriging的距离矩阵
+    dist_n0 = distance('gc', PF_remaining(:, 3), PF_remaining(:, 4), lat1, lon1, R);
+
+    num_samples = size(PF_remaining, 1);
+    [M, N] = meshgrid(1:num_samples);
+    lat_m = PF_remaining(M(:), 3);
+    lon_m = PF_remaining(M(:), 4);
+    lat_n = PF_remaining(N(:), 3);
+    lon_n = PF_remaining(N(:), 4);
+    t_m=PF_remaining(M(:), 1);
+    t_n=PF_remaining(N(:), 1);
+    dist_nn = reshape(distance('gc', lat_m, lon_m, lat_n, lon_n, R), num_samples, num_samples);
+    time_diff = abs(t_m - t_n);
+    t_nn=reshape(time_diff, num_samples, num_samples);
+
+    % RCM calculation
+    lati_mean=mean(PF_remaining(:, 3)); % average latitude and longitude
+    long_mean=mean(PF_remaining(:, 4));
+    Rcentroid1=distance('gc',lati_mean,long_mean,lat1,lon1,6378.137);
+    RCM1=Rcentroid1/Rfitt;
+
+    % TCM calculation
+    if R_T==0
+        TCM=0;
+    else
+        TCM=mean(t_remaining)/R_T;
+    end
+    data_values = PF_remaining(:, 5); % 假设第5列为待估计值
+    [X, Y] = meshgrid(0); % 目标点相对位置
+
+    [UnK_result,~]=STkriging(STmodels, East2, North2,t_remaining, data_values, X, Y, 0,dist_nn, dist_n0,t_nn, target_point(5));
+    %ST_threat(model,x,y,t_n0,z,xi,yi,ti,dis_nn,dis_n0,t_nn,chunksize)
+    %zi,chi,chi_irreg,R_irreg,sigma_IPP,sigma_inflated
+    if isempty(UnK_result)
+        Zhat = NaN;
+        return
+    end
+    sigma2_undersampled=(UnK_result(1)-target_point(5))^2/(5.33^2)-UnK_result(6);
+    sigma_undersampled=sqrt(max(sigma2_undersampled,0));
+    Zhat = [UnK_result Rfitt RCM1 R_T TCM sigma_undersampled];
+end

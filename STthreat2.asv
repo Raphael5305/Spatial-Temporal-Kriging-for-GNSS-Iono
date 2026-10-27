@@ -1,0 +1,328 @@
+function results = STthreat2(ST_STmodels,R, N, IPPVD, samp_int, Rin_numbers,IGPs, Broadcast_GIVD, Broadcast_IGPs,dq)
+% Inputs:
+% R = [R_min, R_max], N = [N_min, N_target], IPPVD = PF data
+% ST_S, ST_T, ST_ST = Data for computing ST_STmodel2
+% epoch_t = Epoch time array
+
+if nargin < 10, dq = []; end
+
+R_min = R(1); %#ok<NASGU> % 仅保留 800km for WAAS
+R_max = R(2); % 2100km 
+N_min = N(1);  %10
+N_target = N(2); % 30
+
+wgs84   = wgs84Ellipsoid('kilometer');
+height  = 350000/1000; % km
+R_earth = 6378.137;    % km
+
+PF = IPPVD; % IPPVD should be detrended PF data:STPF,unit:m
+
+
+% 规范 IGPs 经度 [-180,180]
+IGP_lat = IGPs(:,1);
+IGP_lon = mod(IGPs(:,2) + 180, 360) - 180;
+
+% 规范 Broadcast_IGPs 经度
+B_lat = Broadcast_IGPs(:,1);
+B_lon = mod(Broadcast_IGPs(:,2) + 180, 360) - 180;
+Broadcast_IGPs = [B_lat, B_lon];
+
+% 历元集合（按 samp_int 下采样）
+all_epochs = unique(IPPVD(:,1), 'stable');
+est_epochs = all_epochs(1:samp_int:numel(all_epochs));
+num_epochs = numel(est_epochs);
+num_igps   = numel(IGP_lat);
+
+save_row=0;
+results = zeros((Rin_numbers+1)* num_epochs*num_igps, 17);
+
+% --- IGP → Broadcast_IGPs 映射（精确匹配；你需要最近邻可自行加上） ---
+tol = 1e-8;
+B_map = nan(num_igps,1);
+for ig = 1:num_igps
+    mask_lat = abs(B_lat - IGP_lat(ig)) <= tol;
+    mask_lon = abs(B_lon - IGP_lon(ig)) <= tol;
+    idx = find(mask_lat & mask_lon, 1, 'first');
+    if ~isempty(idx)
+        B_map(ig) = idx;
+    end
+end
+
+% ---- 主循环 ----
+for ie = 6:num_epochs
+    est_time = est_epochs(ie);
+    % 该历元的 STmodel2（若不存在或为空 → 走 UnK_threat 分支）
+    model_idx = find([ST_STmodels.epoch_time] == est_time, 1, 'first');
+    has_ST = (~isempty(model_idx) && ~isempty(ST_STmodels(model_idx).model));
+
+    if has_ST
+        ST_ST2model = ST_STmodels(model_idx).model;
+    else
+        continue; % 显式为空用于分支判断
+    end
+
+    % 时间窗候选（ST 分支用过去300s；UnK_threat 将改为仅用当前历元）
+    time_range = est_time - 300 : est_time;
+    time_idx_win   = find(ismember(IPPVD(:,1), time_range));  % 窗口索引
+    time_idx_exact = find(IPPVD(:,1) == est_time);            % 当前历元索引
+
+    if isempty(time_idx_win)||isempty(time_idx_exact)
+        % ST需要窗口:若窗口空，直接跳过这个历元；若当前无历元也跳过
+        continue;
+    end
+
+    % 日内 30s 索引 j（列1=00:00:00）
+    j = epoch_to_30s_index(est_time);
+    jj= epoch_to_30s_index(est_time)-1;%判断哪个时间是对的
+
+    for ig = 1:num_igps
+        % Broadcast GIVD 真值（第2列 & 传给 STkriging 用于诊断）
+        truth_val = NaN;
+        truth_val2= NaN;
+        if ~isnan(jj)
+            m = B_map(ig);
+            if ~isnan(m), truth_val = Broadcast_GIVD(m, j); truth_val2 = Broadcast_GIVD(m, jj);end
+        end
+        lat1 = IGP_lat(ig);
+        lon1 = IGP_lon(ig);
+
+        % 进度提示
+
+        if ~isempty(dq) && mod(ie, 50) == 1
+            task = getCurrentTask(); if ~isempty(task), tid = task.ID; else, tid = 0; end
+            send(dq, sprintf('线程 %d | epoch %d/%d | IGP %d/%d', tid, ie, num_epochs, ig, num_igps));
+        end
+
+        % ====================== ST 分支：按 ST 变差值排序 + STkriging ======================
+        lat_cand = IPPVD(time_idx_win, 3);
+        lon_cand = IPPVD(time_idx_win, 4);
+
+        % 候选样本与 IGP 的大圆距离
+        dlat = deg2rad(lat_cand - lat1);
+        dlon = deg2rad(lon_cand - lon1);
+        a = sin(dlat/2).^2 + cos(deg2rad(lat1)).*cos(deg2rad(lat_cand)).*sin(dlon/2).^2;
+        c = 2 * atan2(sqrt(a), sqrt(1-a));
+        Dist_all = R_earth * c;
+
+        selected = (Dist_all <= R_max & Dist_all > 0);
+        idsearch_initial = time_idx_win(selected);
+        if numel(idsearch_initial) < N_min
+            continue;
+        end
+
+        % Step1：以 ST 变差函数排序
+        s = Dist_all(selected);
+        tdiff = abs(IPPVD(idsearch_initial,1) - est_time);
+        vvals = ST_ST2model.func(s, tdiff);
+        [sorted_variogram, ord] = sort(vvals, 'ascend');%从小到大排列
+        idsearch_initial = idsearch_initial(ord);
+        variogram_values = sorted_variogram;
+        % If N_min <= count <= N_target, use all points
+        % Compute max and min variogram values
+        max_variogram = max(variogram_values);
+        min_variogram = min(variogram_values);
+        % Use all IPPs within Rmax to generate GIVD, GIVE
+        PF_samples = PF(idsearch_initial, :);%variogram从小到大排列的IPPs
+        R_out = 0.5 * (max_variogram+min_variogram);
+
+        R_in_values = linspace(min_variogram-1e-10,max_variogram+1e-10,Rin_numbers+1);
+        target_point=[est_time,ig,lat1,lon1,truth_val2];%MT18 as GIVD broadcast
+
+        for r = 1:length(R_in_values)
+            R_in = R_in_values(r);
+            result_once = STdepriveAndEstimate2(R_min,R_max,R_in, R_out, PF_samples, target_point, ST_ST2model, N_min,N_target, wgs84, height, R_earth);
+            if isnan(result_once)
+                continue;
+            end
+            save_row = save_row + 1;
+            results(save_row, :) = [data_est(i, :) result_once];
+        end
+
+        % 截取前 N_target
+        if numel(idsearch_initial) > N_target
+            use_idx = idsearch_initial(1:N_target);
+        else%使用全部IPPs：Nmin-Ntarget
+            use_idx = idsearch_initial;
+        end
+        PF_samples = IPPVD(use_idx, :);
+        if size(PF_samples,1) < N_min, continue; end
+
+
+        % IGP 与样本的距离/时间差
+        dlat = deg2rad(PF_samples(:,3) - lat1);
+        dlon = deg2rad(PF_samples(:,4) - lon1);
+        a = sin(dlat/2).^2 + cos(deg2rad(lat1)).*cos(deg2rad(PF_samples(:,3))).*sin(dlon/2).^2;
+        c = 2 * atan2(sqrt(a), sqrt(1-a));
+        Dist = R_earth * c; % km
+        t_remaining = est_time - PF_samples(:,1);
+
+        % ====== 新：Rfitt 由“已选样本”的几何外延决定（并不低于 R_min；欠采样则置 R_max）======
+        num_cand_used = numel(idsearch_initial);  % ≤ 所有候选(≤R_max)；>=N_min已保证
+        if num_cand_used >= N_target
+            % 正常：选满 N_target，则 Rfitt = max(选中样本距离, R_min)
+            Rfitt = max(max(Dist), R_min);
+        else
+            % 欠采样：R_max 内总样本数在 [N_min, N_target) ⇒ Rfitt = R_max（WAAS 规则）
+            Rfitt = R_max;
+        end
+        R_T   = max(t_remaining);
+
+        % East/North
+        East2  = zeros(size(PF_samples,1),1);
+        North2 = zeros(size(PF_samples,1),1);
+        for k = 1:size(PF_samples,1)
+            [E, Nn, ~] = geodetic2enu(PF_samples(k,3), PF_samples(k,4), height, ...
+                lat1, lon1, height, wgs84, 'degrees');
+            East2(k)  = E;
+            North2(k) = Nn;
+        end
+
+        % 距离矩阵与时间差矩阵
+        num_samples = size(PF_samples,1);
+        dist_n0 = distance('gc', PF_samples(:,3), PF_samples(:,4), lat1, lon1, R_earth);
+        [Mgrid, Ngrid] = meshgrid(1:num_samples);
+        lat_m = PF_samples(Mgrid(:),3);
+        lon_m = PF_samples(Mgrid(:),4);
+        lat_n = PF_samples(Ngrid(:),3);
+        lon_n = PF_samples(Ngrid(:),4);
+        dist_nn = reshape(distance('gc', lat_m, lon_m, lat_n, lon_n, R_earth), num_samples, num_samples);
+        t_m  = PF_samples(Mgrid(:),1);
+        t_n  = PF_samples(Ngrid(:),1);
+        t_nn = reshape(abs(t_m - t_n), num_samples, num_samples);
+
+        % RCM / TCM
+        lati_mean = mean(PF_samples(:,3));
+        long_mean = mean(PF_samples(:,4));
+        Rcentroid1 = distance('gc', lati_mean, long_mean, lat1, lon1, R_earth);
+        RCM1 = Rcentroid1 / max(Rfitt, eps);
+        if R_T == 0, TCM = 0; else, TCM = mean(t_remaining) / R_T; end
+
+        % STkriging（用 truth_val 仅作诊断，不参与权重）
+        data_values = PF_samples(:,5);
+        [X0, Y0] = meshgrid(0);
+        target_truth = truth_val;
+        target_truth2 = truth_val2;
+        [UnK_result, COND] = STkriging(ST_ST2model, East2, North2, t_remaining, data_values, ...
+            X0, Y0, 0, dist_nn, dist_n0, t_nn, target_truth);
+        if isempty(UnK_result), continue; end
+
+        % GIVE/GIVD
+        sigma_undersampled = NaN;
+        sigma_GIVE         = NaN;
+        if strcmpi(type, 'GIVE') && ~isempty(monothreat)
+            Rfit_bin = discretize(Rfitt, Rfit_edges);
+            RCM_bin  = discretize(RCM1, RCM_edges);
+            TCM_bin  = discretize(TCM,  TCM_edges);
+            if ~isnan(Rfit_bin) && ~isnan(RCM_bin) && ~isnan(TCM_bin)
+                % 3D monothreat(TCM,RCM,Rfit)
+                sigma_undersampled = monothreat(TCM_bin, RCM_bin, Rfit_bin);
+                sigma_GIVE = sqrt(sigma_undersampled.^2 + UnK_result(6));
+            end
+        end
+
+        % 写结果
+        save_row = save_row + 1;
+        results(save_row, :) = [ ...
+            est_time, truth_val, truth_val2,lat1, lon1, ...
+            UnK_result(:).', ...
+            Rfitt, RCM1, R_T, TCM, ...
+            sigma_undersampled, sigma_GIVE ...
+            ];
+        CONDs(save_row, :) = COND(:).';
+    end
+end
+
+% 裁剪
+results = results(1:save_row, :);
+end
+
+% === 辅助函数：列1=00:00:00 → j = floor(sod/30)+1 ===
+function j = epoch_to_30s_index(epoch_seconds)
+    if ~isfinite(epoch_seconds), j = NaN; return; end
+    sod = mod(epoch_seconds, 86400);
+    if sod < 0, sod = sod + 86400; end
+    j = floor(sod / 30) + 1; % 0→1, 30→2, ..., 86370→2880
+end
+
+
+    % Process each estimation point
+    for i = 1:size(data_est, 1)
+        if mod(i, 2000) == 1
+            task = getCurrentTask();
+            if ~isempty(task)
+                thread_id = get(task, 'ID');
+            else
+                thread_id = 0; % 如果非并行环境，设为 0
+            end
+            msg = sprintf('线程 %d, i 的数值为 %d, size 为 %d', thread_id, i, size(data_est,1));
+            send(dq, msg);
+        end
+        est_time = data_est(i, 1); % Epoch time of the estimation point
+
+        % Find the precomputed ST_STmodel2
+        model_idx = find([ST_STmodels.epoch_time] == est_time);
+        if isempty(model_idx)
+            % warning('No ST_STmodel2 found for epoch time %f', est_time);
+            continue;
+        end
+        if numel( ST_STmodels(model_idx).Tmodel.obs)<=1
+            continue   % there is no temporal variogram as no pairs within 2 km
+        end
+        ST_ST2model = ST_STmodels(model_idx).model;
+
+        % Select sampling points: current epoch and previous 150 seconds
+        time_range = est_time - 150 : est_time;
+        time_idx = find(ismember(PF(:, 1), time_range));
+
+        % Compute spatial distances to the estimation point
+        lat1 = data_est(i, 3); % Estimation point latitude
+        lon1 = data_est(i, 4); % Estimation point longitude
+        lat2 = PF(time_idx, 3); % Potential sampling points latitude
+        lon2 = PF(time_idx, 4); % Potential sampling points longitude
+        dlat = deg2rad(lat2 - lat1);
+        dlon = deg2rad(lon2 - lon1);
+        a = sin(dlat / 2).^2 + cos(deg2rad(lat1)) .* cos(deg2rad(lat2)) .* sin(dlon / 2).^2;
+        c = 2 * atan2(sqrt(a), sqrt(1 - a));
+        Dist = R_earth * c; % Distances to the estimation point
+
+        % Select points within 400 km
+        selected = (Dist <= R_max & Dist>0);
+        idsearch_initial = time_idx(selected);
+
+        if numel(idsearch_initial) < N_min
+            continue; % Skip if insufficient sampling points
+        end
+        % Compute spatial distance s and time difference t
+        s = Dist(selected);
+        t = abs(PF(idsearch_initial, 1) - est_time);%是否需要abs呢，应该是reference-IPP
+
+        % Compute variogram values
+        variogram_values = ST_ST2model.func(s, t);
+
+        % Sort by variogram values
+        [sorted_variogram, sort_idx] = sort(variogram_values);
+        idsearch_initial = idsearch_initial(sort_idx);
+        variogram_values = sorted_variogram;
+        % If N_min <= count <= N_target, use all points
+        % Compute max and min variogram values
+        max_variogram = max(variogram_values);
+        min_variogram = min(variogram_values);
+
+        % Use selected sampling points
+        PF_samples = PF(idsearch_initial, :);
+        target_point = data_est(i, :);
+        R_out = 0.5 * (max_variogram+min_variogram);
+        R_in_values = linspace(min_variogram-1e-10,max_variogram+1e-10,Rin_numbers+1);
+
+        for r = 1:length(R_in_values)
+            R_in = R_in_values(r);
+            result_once = STdepriveAndEstimate(R_in, R_out, PF_samples, target_point, ST_ST2model, N_min,N_target, wgs84, height, R_earth);
+            if isnan(result_once)
+                continue;
+            end
+            save_row = save_row + 1;
+            results(save_row, :) = [data_est(i, :) result_once];
+        end
+    end
+    results = results(~all(results == 0, 2), :); % Remove unused rows
+end
